@@ -1,94 +1,57 @@
 const router = require("express").Router();
 const db = require("../db");
 const authMW = require("../middleware/auth");
-const Stripe = require("stripe");
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
 
 const PLANS = {
   premium: { monthly: 4900, yearly: 49000 },
-  vip:     { monthly: 12500, yearly: 120000 },
+  vip: { monthly: 12500, yearly: 120000 },
 };
 
-router.post("/stripe/create", authMW, async (req, res) => {
-  const { plan, billing_cycle } = req.body;
+router.post("/notchpay/create", authMW, async (req, res) => {
+  const { plan, billing_cycle, email, phone } = req.body;
   if (!PLANS[plan]) return res.status(400).json({ error: "Plan invalide." });
   const amount = PLANS[plan][billing_cycle || "monthly"];
   try {
     const user = await db.query(
       "SELECT email, full_name FROM users WHERE id = $1", [req.userId]
     );
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
-      line_items: [{
-        price_data: {
-          currency: "xof",
-          product_data: { name: `DJANDJOU 3.0 — ${plan} (${billing_cycle})` },
-          unit_amount: amount,
-        },
-        quantity: 1,
-      }],
-      customer_email: user.rows[0].email,
-      mode: "payment",
-      success_url: `${process.env.FRONTEND_URL}/payment-success`,
-      cancel_url: `${process.env.FRONTEND_URL}/premium`,
-      metadata: { user_id: req.userId, plan, billing_cycle },
-    });
-    await db.query(
-      `INSERT INTO subscriptions (user_id, plan, billing_cycle, amount, payment_method, payment_ref, status)
-       VALUES ($1, $2, $3, $4, 'stripe', $5, 'pending')`,
-      [req.userId, plan, billing_cycle, amount, session.id]
-    );
-    res.json({ checkout_url: session.url });
-  } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ error: "Erreur paiement Stripe." });
-  }
-});
-
-router.post("/fedapay/create", authMW, async (req, res) => {
-  const { plan, billing_cycle, phone_number, network } = req.body;
-  if (!PLANS[plan]) return res.status(400).json({ error: "Plan invalide." });
-  if (!phone_number) return res.status(400).json({ error: "Numéro requis." });
-  const amount = PLANS[plan][billing_cycle || "monthly"];
-  try {
-    const user = await db.query(
-      "SELECT email, full_name FROM users WHERE id = $1", [req.userId]
-    );
-    const fedaRes = await fetch("https://api.fedapay.com/v1/transactions", {
+    const response = await fetch("https://api.notchpay.co/payments/initialize", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.FEDAPAY_SECRET_KEY}`,
+        "Authorization": process.env.NOTCHPAY_PUBLIC_KEY,
       },
       body: JSON.stringify({
-        description: `DJANDJOU 3.0 — ${plan}`,
         amount,
-        currency: { iso: "XOF" },
-        callback_url: `${process.env.API_URL}/api/payments/fedapay/callback`,
-        customer: { email: user.rows[0].email },
+        currency: "XAF",
+        email: user.rows[0].email,
+        phone: phone || "",
+        reference: `djandjou_${req.userId}_${Date.now()}`,
+        callback: `${process.env.API_URL}/api/payments/notchpay/callback`,
+        description: `DJANDJOU 3.0 — ${plan} (${billing_cycle})`,
       }),
     });
-    const fedaData = await fedaRes.json();
-    const transactionId = fedaData.v1?.transaction?.id;
-    const paymentUrl = fedaData.v1?.transaction?.links?.payment_url;
+    const data = await response.json();
+    if (!data.transaction)
+      return res.status(500).json({ error: "Erreur Notchpay." });
     await db.query(
       `INSERT INTO subscriptions (user_id, plan, billing_cycle, amount, payment_method, payment_ref, status)
-       VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
-      [req.userId, plan, billing_cycle, amount, `fedapay_${network}`, String(transactionId)]
+       VALUES ($1, $2, $3, $4, 'notchpay', $5, 'pending')`,
+      [req.userId, plan, billing_cycle, amount, data.transaction.reference]
     );
-    res.json({ payment_url: paymentUrl, transaction_id: transactionId });
+    res.json({ payment_url: data.authorization_url, reference: data.transaction.reference });
   } catch (err) {
     console.error(err.message);
-    res.status(500).json({ error: "Erreur paiement FedaPay." });
+    res.status(500).json({ error: "Erreur lors du paiement." });
   }
 });
 
-router.post("/fedapay/callback", async (req, res) => {
-  const { id, status } = req.body;
-  if (status !== "approved") return res.json({ received: true });
+router.post("/notchpay/callback", async (req, res) => {
+  const { reference, status } = req.body;
+  if (status !== "complete") return res.json({ received: true });
   try {
     const sub = await db.query(
-      "SELECT * FROM subscriptions WHERE payment_ref = $1", [String(id)]
+      "SELECT * FROM subscriptions WHERE payment_ref = $1", [reference]
     );
     if (sub.rows.length === 0) return res.json({ received: true });
     const { user_id, plan, billing_cycle } = sub.rows[0];
@@ -96,7 +59,7 @@ router.post("/fedapay/callback", async (req, res) => {
     const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000);
     await db.query(
       "UPDATE subscriptions SET status = 'active', expires_at = $1 WHERE payment_ref = $2",
-      [expiresAt, String(id)]
+      [expiresAt, reference]
     );
     await db.query(
       "UPDATE users SET plan = $1, is_premium = TRUE, plan_expires_at = $2 WHERE id = $3",
